@@ -107,13 +107,42 @@ def format_interrupt(interrupts: Any) -> str:
         prompt = val.get("prompt", "")
         if phase == "kickoff":
             spec = val.get("spec", "")
-            return truncate(f"{prompt}\n\n{spec}", 3500)
+            return truncate(
+                f"{prompt}\n\n{spec}\n\n"
+                "Reply **yes** to approve, **no** + edits to revise. "
+                "Re-pasting the same brief counts as **yes**.",
+                3500,
+            )
         if phase == "acceptance":
             summ = val.get("summary", "")
             extra = val.get("spec_excerpt", "")
-            return truncate(f"{prompt}\n\n{summ}\n\n{extra}", 3500)
+            return truncate(
+                f"{prompt}\n\n{summ}\n\n{extra}\n\n"
+                "Reply **yes** to release, **no** + notes for rework. "
+                "Short side questions (e.g. **where is this deployed?**) get a chat reply — they do not count as your vote.",
+                3500,
+            )
         return truncate(json.dumps(val, indent=2, ensure_ascii=False), 3500)
     return truncate(str(val), 3500)
+
+
+def looks_like_kickoff_brief_reaffirmation(user_text: str, spec: str) -> bool:
+    """Message is essentially the stored product spec again (kickoff or ship gate). Counts as implicit yes."""
+    from difflib import SequenceMatcher
+
+    u = (user_text or "").strip().lower()
+    s = (spec or "").strip().lower()
+    if len(u) < 20 or len(s) < 20:
+        return False
+    if u == s:
+        return True
+    if SequenceMatcher(None, u, s).ratio() >= 0.9:
+        return True
+    if s in u and len(u) - len(s) <= 16:
+        return True
+    if u in s and len(u) / max(len(s), 1) >= 0.88:
+        return True
+    return False
 
 
 def looks_like_new_brief_while_awaiting_owner(text: str) -> bool:
@@ -180,6 +209,12 @@ def looks_like_meta_chat_while_awaiting_owner(text: str) -> bool:
         return False
     if "?" in t:
         return True
+    if len(t) <= 400 and re.search(
+        r"\b(where|which\s+url|what\s+url|deploy|deployed|deployment|hostname|cdn|"
+        r"how\s+do\s+i\s+(open|find|access)|link\s+to)\b",
+        t,
+    ):
+        return True
     fragments = (
         "what is this",
         "what's this",
@@ -204,7 +239,7 @@ def looks_like_idle_workflow_brief(text: str) -> bool:
     low = t.lower()
     words = t.split()
     n = len(words)
-    if low.startswith(("new project:", "new project :")):
+    if low.startswith("new project"):
         return True
     if len(t) >= 200:
         return True
@@ -272,14 +307,30 @@ def idle_pm_chat_fallback() -> str:
     )
 
 
-def owner_gate_sidebar_fallback(_user_message: str, _spec: str, status: str | None) -> str:
+def owner_gate_sidebar_fallback(
+    user_message: str, _spec: str, status: str | None, impl: str = ""
+) -> str:
     """Compact PM line when LLM is off / failed."""
     from black_company.company_context import company_context_for_llm
 
     ctx = company_context_for_llm().replace("\n", " ").strip()
     if len(ctx) > 200:
         ctx = ctx[:197] + "…"
+    um = (user_message or "").lower()
     if status == "awaiting_owner_acceptance":
+        if any(k in um for k in ("deploy", "where", "url", "host", "link")):
+            i = (impl or "").replace("\n", " ").strip()
+            if len(i) > 30:
+                clip = i[:520] + ("…" if len(i) > 520 else "")
+                return (
+                    f"From the latest **impl** snapshot:\n{clip}\n\n"
+                    "If there’s no URL there, this run didn’t capture hosting — check your static host or CI. "
+                    "Reply **yes** / **no** on the release line above."
+                )
+            return (
+                "This snapshot doesn’t include a deploy URL. Check your static host (e.g. GitHub Pages, Vercel) or CI logs. "
+                "Reply **yes** / **no** on the ship line above."
+            )
         return f"Still on the ship call above — {ctx}"
     return f"Still on kickoff above — {ctx}"
 
@@ -289,11 +340,11 @@ def help_text() -> str:
         "**How this chat maps to the workflow**\n"
         "• **Hi / hey** — quick wave, no workflow.\n"
         "• Most other lines → **PM chat** (planning, context, how this works) without starting a run.\n"
-        "• A **concrete brief**, **/run**, or **New project:** … → PM+Owner+Eng workflow on this thread.\n"
+        "• A **concrete brief**, **/run**, or **New project** … (colon optional) → PM+Owner+Eng workflow on this thread.\n"
         "• When you see an **Owner** question, the next line is read as **yes / no + notes** "
         "(chit-chat is treated separately when we can tell).\n"
         "• **/reset** — new LangGraph thread; describe what to build next.\n"
-        "• **New project:** … — explicit new brief.\n"
+        "• **New project** … — explicit new brief (`:` optional).\n"
         "• **growth** / **milestones** — what the team stored from past runs.\n\n"
         "**Org copy for the PM** — set in `.env`:\n"
         "`BLACK_COMPANY_NAME`, `BLACK_COMPANY_BLURB`, `BLACK_COMPANY_PROJECTS`"
@@ -319,10 +370,14 @@ def is_growth_lookup(text: str) -> bool:
 
 
 def strip_new_project_prefix(text: str) -> str:
-    """If user uses `New project: ...`, return the body as the spec."""
+    """Strip `New project:` or `New project …` (colon optional) and return the brief body."""
     t = text.strip()
     low = t.lower()
-    for prefix in ("new project:", "new project :"):
-        if low.startswith(prefix):
-            return t[len(prefix) :].strip()
-    return t
+    if not low.startswith("new project"):
+        return t
+    rest = t[len("new project") :].lstrip()
+    rest_low = rest.lower()
+    for mark in (":", "—", "-"):
+        if rest_low.startswith(mark):
+            return rest[1:].strip()
+    return rest.strip()

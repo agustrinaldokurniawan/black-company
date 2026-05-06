@@ -17,8 +17,10 @@ def _norm_reply(reply: Any) -> str:
 
 
 def _is_yes(reply: Any) -> bool:
-    s = _norm_reply(reply).lower()
-    return s.startswith("y") or s in ("approve", "approved", "ok", "yes", "1", "👍")
+    s = _norm_reply(reply).lower().strip()
+    if s in ("approve", "approved", "ok", "okay", "yes", "1", "👍", "sure", "yep", "yeah", "lgtm"):
+        return True
+    return s.startswith("y") or s.startswith("ok ") or s.startswith("yes ") or s.startswith("yep ")
 
 
 def _is_no(reply: Any) -> bool:

@@ -143,6 +143,7 @@ def try_telegram_owner_gate_sidebar(
     user_message: str,
     spec: str | None,
     status: str | None,
+    impl_excerpt: str | None = None,
 ) -> str | None:
     """PM-voice reply during Owner interrupt when user chats instead of voting."""
     if not deepseek_enabled():
@@ -153,6 +154,10 @@ def try_telegram_owner_gate_sidebar(
         if status == "awaiting_owner_acceptance"
         else "Owner kickoff — approve or reshape the brief before planning and build."
     )
+    impl_block = ""
+    clipped_impl = _clip(impl_excerpt or "", 900)
+    if clipped_impl:
+        impl_block = f"\nImplementation notes (excerpt):\n{clipped_impl}\n"
     return _complete(
         "You are the PM on Telegram; the same human often wears the Owner hat. "
         f"They’re formally on: {phase} "
@@ -161,29 +166,34 @@ def try_telegram_owner_gate_sidebar(
         "Use company context as background only—no brochure dump. "
         "Do NOT explain Telegram mechanics, resume wiring, bots, or footers. "
         "Do NOT paste the whole brief; at most six words quoted if essential. "
-        "Answer their question, say what decision we’re blocked on, nudge yes/no or a clearer ask. "
+        "If they ask where it is deployed or hosted, answer ONLY from implementation notes below if a URL or host is stated; "
+        "otherwise say this snapshot doesn’t include a live deploy URL and they should check CI logs or the static host they used. "
+        "Say what decision we’re blocked on, nudge yes/no when appropriate. "
         + GROUNDING_RULES,
         f"Company context:\n{ctx}\n\n"
-        f"Thread brief (may be thin):\n{_clip(spec or '', 900)}\n\n"
+        f"Thread brief (may be thin):\n{_clip(spec or '', 900)}\n"
+        f"{impl_block}\n"
         f"They wrote:\n{_clip(user_message, 500)}",
     )
 
 
 def try_telegram_idle_pm_chat(user_message: str) -> str | None:
-    """Conversational PM when no workflow is active — grounding on company context only."""
+    """Conversational PM when no workflow is active — synthesize drafts; avoid question fatigue."""
     if not deepseek_enabled():
         return None
     ctx = company_context_for_llm()
     return _complete(
-        _PM_SYSTEM
-        + " There is NO active LangGraph run and NO Owner question on screen — this is normal DM chat. "
-        "Answer what they asked: product/org questions (use company context), how this channel works, "
-        "light planning or tradeoff chat. "
-        "If they want the full PM→Owner→Eng loop, say they can send a concrete build brief, "
-        "use **New project:** …, or **/run**. Mention **/help** if useful. "
-        "5–10 short lines max unless they asked for depth. "
-        "Do NOT paste fake Owner kickoff blocks or ask them to approve a non-existent gate. "
-        + GROUNDING_RULES,
+        "You write short, natural Slack-DM as a senior PM. "
+        "No markdown headings. No emojis unless the user used them.\n"
+        "No active LangGraph run — informal chat only. Use company context for org facts; "
+        "do not invent **verified** company details.\n"
+        "ANTI-FATIGUE: If they want something standard (e.g. weather web, current+forecast+history, modern UI, public demo), "
+        "do **not** send a long checklist of questions. Prefer **one** short reply with sensible **assumptions** "
+        "and a **draft brief** (4–8 lines or tight bullets) they can paste after **New project** or use with **/run**. "
+        "At most **one** clarifying question, only if you cannot draft anything. "
+        "Direct answers and tradeoffs: keep to ≤8 short lines.\n"
+        "Do NOT paste Owner kickoff approval blocks or pretend a gate is waiting.\n"
+        "If useful: mention **/help** for channel mechanics.",
         f"Company context:\n{ctx}\n\nThey wrote:\n{_clip(user_message, 1200)}",
     )
 

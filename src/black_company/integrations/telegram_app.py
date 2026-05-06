@@ -15,7 +15,7 @@ Env:
   BLACK_COMPANY_PROJECTS   — optional; active tracks / products (short)
 
 Chat: **PM chat** by default (planning, context, how this works). A **concrete brief**, **/run**, or
-**New project:** … starts the team graph (typing indicator, one reply with Owner gate or recap). **Hi / hey**
+**New project** … (`:` optional) starts the team graph (typing indicator, one reply with Owner gate or recap). **Hi / hey**
 stays a lightweight wave. **growth** / **milestones** for memory stats. Slash: /start /reset /growth /run /help.
 """
 
@@ -50,6 +50,7 @@ from black_company.integrations.telegram_chat import (
     is_growth_lookup,
     looks_like_greeting_only,
     looks_like_idle_workflow_brief,
+    looks_like_kickoff_brief_reaffirmation,
     looks_like_meta_chat_while_awaiting_owner,
     looks_like_new_brief_while_awaiting_owner,
     owner_gate_sidebar_fallback,
@@ -175,6 +176,7 @@ def _prepare_thread_for_new_workflow(context: ContextTypes.DEFAULT_TYPE, chat_id
         context.chat_data["thread_id"] = f"tg-{chat_id}-{uuid.uuid4().hex[:10]}"
     context.chat_data["run_finished"] = False
     context.chat_data["awaiting_resume"] = False
+    context.chat_data.pop("last_interrupt_phase", None)
 
 
 async def _emit_invoke_result(
@@ -191,6 +193,7 @@ async def _emit_invoke_result(
     if intr:
         context.chat_data["awaiting_resume"] = True
         context.chat_data["run_finished"] = False
+        context.chat_data["last_interrupt_phase"] = _intr_phase(intr)
         record_event(
             kind="owner_interrupt",
             source="telegram",
@@ -207,6 +210,7 @@ async def _emit_invoke_result(
 
     context.chat_data["awaiting_resume"] = False
     context.chat_data["run_finished"] = True
+    context.chat_data.pop("last_interrupt_phase", None)
     record_event(
         kind="run_completed",
         source="telegram",
@@ -284,6 +288,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.chat_data["thread_id"] = f"tg-{chat}-{uuid.uuid4().hex[:10]}"
     context.chat_data["awaiting_resume"] = False
     context.chat_data["run_finished"] = True
+    context.chat_data.pop("last_interrupt_phase", None)
     record_event(
         kind="session_reset",
         source="telegram",
@@ -338,14 +343,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.effective_message.reply_text(truncate(casual_greeting_while_owner_waits(), 4000))
                 return
 
+            phase = context.chat_data.get("last_interrupt_phase")
+            if phase == "kickoff":
+                values_k = await _graph_state_values(graph, config)
+                spec_stored = str(values_k.get("spec") or "")
+                if looks_like_kickoff_brief_reaffirmation(text, spec_stored):
+                    await update.effective_message.reply_text(
+                        truncate("Got it — same brief counts as **yes**. Continuing…", 4000)
+                    )
+                    text = "yes"
+            elif phase == "acceptance":
+                values_a = await _graph_state_values(graph, config)
+                spec_acc = str(values_a.get("spec") or "")
+                if looks_like_kickoff_brief_reaffirmation(text, spec_acc):
+                    await update.effective_message.reply_text(
+                        truncate("Understood — re-sending the spec counts as **yes** for release.", 4000)
+                    )
+                    text = "yes"
+
             if looks_like_meta_chat_while_awaiting_owner(text):
                 values = await _graph_state_values(graph, config)
                 from black_company.llm.deepseek_copy import try_telegram_owner_gate_sidebar
 
                 spec = str(values.get("spec") or "")
                 st = str(values.get("status") or "")
-                llm = await asyncio.to_thread(try_telegram_owner_gate_sidebar, text, spec, st)
-                msg = llm or owner_gate_sidebar_fallback(text, spec, st)
+                impl_ex = str(values.get("impl") or "")
+                llm = await asyncio.to_thread(try_telegram_owner_gate_sidebar, text, spec, st, impl_ex)
+                msg = llm or owner_gate_sidebar_fallback(text, spec, st, impl_ex)
                 await update.effective_message.reply_text(truncate(msg, 4000))
                 return
 
