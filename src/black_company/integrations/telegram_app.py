@@ -1,4 +1,4 @@
-"""Telegram bot: Owner talks to PM only; graph pauses on Owner interrupt (resume = chat messages).
+"""Telegram bot: chat like the team — plain messages start work; Owner answers in thread.
 
 Loads `.env` from the current working directory when `python-dotenv` is installed (included in the `telegram` extra).
 
@@ -7,13 +7,14 @@ Env:
   TELEGRAM_ALLOWED_USER_IDS — optional comma-separated Telegram user ids; if empty, any user (dev only)
   BLACK_COMPANY_DATA_DIR   — optional; default `./data` — growth memory SQLite + metadata
 
-Commands: /start /run /reset /growth — text replies resume an interrupt.
+Chat: send what you’d say to a PM (“hey, can we add a wallet to this project?”). The bot replies in-character,
+then runs the graph until it needs Owner input — reply with normal text (yes / no / notes). Optional:
+type **growth** or **milestones** for memory stats. Slash commands are optional (/start /reset /growth /run).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import uuid
@@ -31,6 +32,14 @@ except ImportError as e:
 
 from black_company.graph import build_graph
 from black_company.growth import format_report, record_event
+from black_company.integrations.telegram_chat import (
+    format_interrupt,
+    is_growth_lookup,
+    pm_intro_after_request,
+    pm_run_complete_message,
+    strip_new_project_prefix,
+    truncate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,38 +54,6 @@ def _allowed_user(user_id: int) -> bool:
         if part.isdigit():
             allowed.add(int(part))
     return user_id in allowed
-
-
-def _truncate(s: str, n: int = 3500) -> str:
-    s = s.strip()
-    return s if len(s) <= n else s[: n - 20] + "\n…(truncated)"
-
-
-def _format_interrupt(interrupts: Any) -> str:
-    if not interrupts:
-        return "Reply with text to continue."
-    seq = interrupts if isinstance(interrupts, (list, tuple)) else (interrupts,)
-    if not seq:
-        return "Reply with text to continue."
-    first = seq[0]
-    val = getattr(first, "value", first)
-    if isinstance(val, dict):
-        phase = val.get("phase", "")
-        prompt = val.get("prompt", "")
-        if phase == "kickoff":
-            spec = val.get("spec", "")
-            return _truncate(f"{prompt}\n\n--- Spec ---\n{spec}")
-        if phase == "acceptance":
-            summ = val.get("summary", "")
-            extra = val.get("spec_excerpt", "")
-            return _truncate(f"{prompt}\n\n--- Readiness ---\n{summ}\n\n--- Spec (excerpt) ---\n{extra}")
-        return _truncate(json.dumps(val, indent=2, ensure_ascii=False))
-    return _truncate(str(val))
-
-
-def _preview_state(out: dict[str, Any]) -> str:
-    pub = {k: out[k] for k in sorted(out) if not str(k).startswith("_") and k != "messages"}
-    return _truncate(json.dumps(pub, indent=2, default=str))
 
 
 def _intr_phase(intr: Any) -> str | None:
@@ -102,16 +79,109 @@ async def _invoke(graph: Any, inp: dict[str, Any] | Command, config: dict[str, A
     return await asyncio.to_thread(graph.invoke, inp, config)
 
 
+def _invoke_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
+    lock = context.chat_data.get("_invoke_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        context.chat_data["_invoke_lock"] = lock
+    return lock
+
+
+def _prepare_thread_for_new_workflow(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Fresh LangGraph thread after a completed slice, or first message in a chat."""
+    if context.chat_data.get("run_finished", True):
+        context.chat_data["thread_id"] = f"tg-{chat_id}-{uuid.uuid4().hex[:10]}"
+    context.chat_data["run_finished"] = False
+    context.chat_data["awaiting_resume"] = False
+
+
+async def _emit_invoke_result(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    out: dict[str, Any],
+    *,
+    pm_preamble: str | None,
+) -> None:
+    intr = out.get("__interrupt__")
+    chat = update.effective_chat.id
+    tid = context.chat_data["thread_id"]
+
+    if intr:
+        context.chat_data["awaiting_resume"] = True
+        context.chat_data["run_finished"] = False
+        record_event(
+            kind="owner_interrupt",
+            source="telegram",
+            actor=_actor(update),
+            chat_id=str(chat),
+            thread_id=tid,
+            detail={"phase": _intr_phase(intr)},
+        )
+        body = format_interrupt(intr)
+        if pm_preamble:
+            body = f"{pm_preamble}\n\n— — —\n\n{body}"
+        await update.effective_message.reply_text(truncate(body, 4000))
+        return
+
+    context.chat_data["awaiting_resume"] = False
+    context.chat_data["run_finished"] = True
+    record_event(
+        kind="run_completed",
+        source="telegram",
+        actor=_actor(update),
+        chat_id=str(chat),
+        thread_id=tid,
+        detail={
+            "status": out.get("status"),
+            "qa_result": out.get("qa_result"),
+            "pair_round": out.get("pair_round"),
+        },
+    )
+    body = pm_run_complete_message(out)
+    if pm_preamble:
+        body = f"{pm_preamble}\n\n— — —\n\n{body}"
+    await update.effective_message.reply_text(truncate(body, 4000))
+
+
+async def _start_workflow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    spec: str | None,
+    intro_from_user_text: str | None,
+) -> None:
+    chat = update.effective_chat.id
+    _prepare_thread_for_new_workflow(context, chat)
+    tid = context.chat_data["thread_id"]
+    config = {"configurable": {"thread_id": tid}}
+    graph = context.application.bot_data["graph"]
+
+    inp: dict[str, Any] = {"spec": spec} if spec else {}
+    record_event(
+        kind="run_started",
+        source="telegram",
+        actor=_actor(update),
+        chat_id=str(chat),
+        thread_id=tid,
+        detail={"from_chat": bool(intro_from_user_text)},
+    )
+    await update.effective_message.reply_text("On it — running the team on this now.")
+    out = await _invoke(graph, inp, config)
+    preamble = pm_intro_after_request(intro_from_user_text) if intro_from_user_text else None
+    await _emit_invoke_result(update, context, out, pm_preamble=preamble)
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user and not _allowed_user(update.effective_user.id):
         await update.effective_message.reply_text("Not authorized.")
         return
     await update.effective_message.reply_text(
-        "black-company: PM-hub workflow.\n"
-        "/run — start (or continue after /reset)\n"
-        "/reset — new LangGraph thread for this chat\n"
-        "/growth — milestones & stats (remembers growth)\n\n"
-        "When the bot asks a question, reply with a normal message (yes / no / notes)."
+        "I’m your PM hub — talk like we’re already in Slack.\n\n"
+        "• Send what you need, e.g. “can we add a wallet feature to this project?”\n"
+        "• When I pause for **Owner** review, reply in plain English (yes / no / notes).\n"
+        "• Say **growth** or **milestones** to see what the team remembered from past runs.\n"
+        "• **New project:** … starts a fresh thread with that brief (optional prefix).\n\n"
+        "Optional commands: /reset (clear session), /run (demo default brief), /growth."
     )
 
 
@@ -123,6 +193,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     old_tid = context.chat_data.get("thread_id")
     context.chat_data["thread_id"] = f"tg-{chat}-{uuid.uuid4().hex[:10]}"
     context.chat_data["awaiting_resume"] = False
+    context.chat_data["run_finished"] = True
     record_event(
         kind="session_reset",
         source="telegram",
@@ -131,116 +202,77 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         thread_id=context.chat_data["thread_id"],
         detail={"previous_thread_id": old_tid},
     )
-    await update.effective_message.reply_text("New session for this chat. Use /run.")
+    await update.effective_message.reply_text(
+        "Session cleared. Tell me what you want to build — same as messaging a real PM."
+    )
 
 
 async def growth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed_user(update.effective_user.id):
         await update.effective_message.reply_text("Not authorized.")
         return
-    await update.effective_message.reply_text(_truncate(format_report(limit=15), 4000))
+    await update.effective_message.reply_text(truncate(format_report(limit=15), 4000))
 
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed_user(update.effective_user.id):
         await update.effective_message.reply_text("Not authorized.")
         return
-    chat = update.effective_chat.id
-    if "thread_id" not in context.chat_data:
-        context.chat_data["thread_id"] = f"tg-{chat}-{uuid.uuid4().hex[:10]}"
-    tid = context.chat_data["thread_id"]
-    config = {"configurable": {"thread_id": tid}}
-    graph = context.application.bot_data["graph"]
-
-    context.chat_data["awaiting_resume"] = False
-    record_event(
-        kind="run_started",
-        source="telegram",
-        actor=_actor(update),
-        chat_id=str(chat),
-        thread_id=tid,
-    )
-    await update.effective_message.reply_text("Running…")
-    out = await _invoke(graph, {}, config)
-    intr = out.get("__interrupt__")
-    if intr:
-        context.chat_data["awaiting_resume"] = True
-        record_event(
-            kind="owner_interrupt",
-            source="telegram",
-            actor=_actor(update),
-            chat_id=str(chat),
-            thread_id=tid,
-            detail={"phase": _intr_phase(intr)},
-        )
-        await update.effective_message.reply_text(_format_interrupt(intr))
-        return
-    record_event(
-        kind="run_completed",
-        source="telegram",
-        actor=_actor(update),
-        chat_id=str(chat),
-        thread_id=tid,
-        detail={
-            "status": out.get("status"),
-            "qa_result": out.get("qa_result"),
-            "pair_round": out.get("pair_round"),
-        },
-    )
-    await update.effective_message.reply_text("Done:\n" + _preview_state(out))
+    async with _invoke_lock(context):
+        await _start_workflow(update, context, spec=None, intro_from_user_text=None)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed_user(update.effective_user.id):
         return
-    if not context.chat_data.get("awaiting_resume"):
-        return
     text = (update.message and update.message.text) or ""
-    context.chat_data["awaiting_resume"] = False
-
-    if "thread_id" not in context.chat_data:
-        await update.effective_message.reply_text("Use /run first.")
+    if not text.strip():
         return
-    tid = context.chat_data["thread_id"]
-    config = {"configurable": {"thread_id": tid}}
-    graph = context.application.bot_data["graph"]
-    chat = update.effective_chat.id
 
-    record_event(
-        kind="owner_resume",
-        source="telegram",
-        actor=_actor(update),
-        chat_id=str(chat),
-        thread_id=tid,
-        detail={"text_preview": text[:300]},
-    )
-    out = await _invoke(graph, Command(resume=text), config)
-    intr = out.get("__interrupt__")
-    if intr:
-        context.chat_data["awaiting_resume"] = True
-        record_event(
-            kind="owner_interrupt",
-            source="telegram",
-            actor=_actor(update),
-            chat_id=str(chat),
-            thread_id=tid,
-            detail={"phase": _intr_phase(intr)},
+    async with _invoke_lock(context):
+        if is_growth_lookup(text):
+            await update.effective_message.reply_text(truncate(format_report(limit=15), 4000))
+            return
+
+        if context.chat_data.get("awaiting_resume"):
+            context.chat_data["awaiting_resume"] = False
+            if "thread_id" not in context.chat_data:
+                await update.effective_message.reply_text(
+                    "No active session — just describe what you want to ship."
+                )
+                return
+            tid = context.chat_data["thread_id"]
+            config = {"configurable": {"thread_id": tid}}
+            graph = context.application.bot_data["graph"]
+            chat = update.effective_chat.id
+
+            record_event(
+                kind="owner_resume",
+                source="telegram",
+                actor=_actor(update),
+                chat_id=str(chat),
+                thread_id=tid,
+                detail={"text_preview": text[:300]},
+            )
+            out = await _invoke(graph, Command(resume=text), config)
+            await _emit_invoke_result(update, context, out, pm_preamble=None)
+            return
+
+        if not context.chat_data.get("run_finished", True):
+            logger.warning("telegram: recovering session (run_finished=false, not awaiting resume)")
+            context.chat_data["run_finished"] = True
+
+        body = strip_new_project_prefix(text).strip()
+        if not body:
+            await update.effective_message.reply_text("Tell me what you’d like the team to work on.")
+            return
+
+        await _start_workflow(
+            update,
+            context,
+            spec=body,
+            intro_from_user_text=body,
         )
-        await update.effective_message.reply_text(_format_interrupt(intr))
-        return
-    record_event(
-        kind="run_completed",
-        source="telegram",
-        actor=_actor(update),
-        chat_id=str(chat),
-        thread_id=tid,
-        detail={
-            "status": out.get("status"),
-            "qa_result": out.get("qa_result"),
-            "pair_round": out.get("pair_round"),
-        },
-    )
-    await update.effective_message.reply_text("Done:\n" + _preview_state(out))
 
 
 def _load_dotenv() -> None:
