@@ -1,0 +1,18 @@
+# Run: copy .env.example to .env and set TELEGRAM_BOT_TOKEN (and optional TELEGRAM_ALLOWED_USER_IDS).
+# Then: docker compose up --build
+#
+# Telegram uses long polling: your phone talks to Telegram’s servers; the container only needs
+# outbound HTTPS. You do not need to publish ports or expose the PC to Wi-Fi for the bot to work.
+services:
+  telegram:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BLACK_COMPANY_DATA_DIR: /data
+    volumes:
+      - black_company_data:/data
+
+volumes:
+  black_company_data:

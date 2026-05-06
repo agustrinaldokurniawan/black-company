@@ -40,10 +40,10 @@ Keep **immutable snapshots** in state if you need auditability (e.g. `spec_v2` a
 
 ### Happy path
 
-1. **ENTRY → PM** — ingest goal; draft **spec** (scope, acceptance criteria, open questions).
-2. **PM ↔ User agent (planning loop)** — same as before; only **PM** sees **User** output. **You** only see **PM** (interrupt PM with **`owner_notes`** if you need to steer—PM then updates **spec** and/or re-runs **User**).
-3. **PM → Owner (kickoff)** — PM presents plan/spec **to you**; you **approve to build** or **send PM back** (never another agent).
-4. **PM → Designer** — after kickoff, **PM** delegates; Designer reads **spec** / PM brief, writes **`design`**.
+1. **ENTRY → PM** — bootstrap **spec** (from Owner’s or Product’s input).
+2. **PM → Owner (kickoff, first)** — you approve or reject the **initial brief** before any Product planning or Engineering runs.
+3. **PM ↔ User agent (planning loop)** — Product and PM tighten the spec; only **PM** sees **User** output.
+4. **PM → Designer** — after planning is satisfied (and kickoff was already approved), **PM** delegates; Designer reads **spec** / PM brief, writes **`design`**.
 5. **PM ↔ Designer** (optional) — if Designer needs clarification, **Designer → PM** (not Owner); PM may come **back to you** only if blocking product questions need Owner input.
 6. **PM → pair programming** — **PM** hands off build instructions; pair loop runs (**Dev ↔ Dev** as before); **Devs** escalate to **PM** when stuck.
 7. **Pair → QA** — **PM** can trigger / frame QA; **QA** reports to **state**; **QA** issues go **QA → PM** (PM sends back to pair/Designer).
@@ -61,7 +61,7 @@ Keep **immutable snapshots** in state if you need auditability (e.g. `spec_v2` a
 
 | When | What PM (or workflow) asks | Your outcomes → routing |
 |------|----------------------------|-------------------------|
-| **Before start** | **PM** shows you spec/plan (already refined with **User agent** off-thread). | **Approve** → **PM** starts **Designer** (or next delegate). **Reject** → **PM** only (PM updates spec / loops **User** again). |
+| **Before start** | **PM** shows you the **initial brief** (Product has **not** run yet). | **Approve** → Product planning loop, then Engineering. **Reject** → **PM** records notes; you can re-approve after revision + planning. |
 | **After QA (agents)** | **PM + User agent** ship check; you are not in this loop. | **User agent** concerns → **PM** triages → **Designer** / **pair** / **QA** as PM decides. |
 | **After PM says ready** | **PM** asks: accept delivery? | **Yes** → **done** (**Owner → PM** marks complete). **No** → **Owner → PM** with rework notes; **PM** routes work—**never** Owner → Designer/QA/Dev/User directly. |
 

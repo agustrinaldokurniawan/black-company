@@ -16,6 +16,7 @@ def create_deepseek_chat(
     model: str | None = None,
     base_url: str | None = None,
     temperature: float = 0.2,
+    max_tokens: int | None = None,
 ) -> Any:
     """
     Build a LangChain chat model pointed at DeepSeek.
@@ -26,6 +27,7 @@ def create_deepseek_chat(
     - DEEPSEEK_API_KEY — required unless `api_key` is passed
     - DEEPSEEK_MODEL — default ``deepseek-chat``
     - DEEPSEEK_BASE_URL — default ``https://api.deepseek.com``
+    - max_tokens — optional cap on completion length
     """
     try:
         from langchain_openai import ChatOpenAI as _ChatOpenAI
@@ -38,9 +40,13 @@ def create_deepseek_chat(
         msg = "Set DEEPSEEK_API_KEY or pass api_key= to create_deepseek_chat()."
         raise ValueError(msg)
 
-    return _ChatOpenAI(
-        model=model or os.environ.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
-        api_key=key,
-        base_url=base_url or os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL),
-        temperature=temperature,
-    )
+    kwargs: dict[str, Any] = {
+        "model": model or os.environ.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+        "api_key": key,
+        "base_url": base_url or os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL),
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+
+    return _ChatOpenAI(**kwargs)

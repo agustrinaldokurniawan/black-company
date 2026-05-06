@@ -1,20 +1,28 @@
-"""Telegram bot: chat like the team — plain messages start work; Owner answers in thread.
+"""Telegram bot: PM chat by default; concrete briefs (or /run) start the team graph.
 
 Loads `.env` from the current working directory when `python-dotenv` is installed (included in the `telegram` extra).
+
+Optional DeepSeek for natural PM + team copy (requires ``pip install -e ".[telegram,llm]"`` and ``DEEPSEEK_API_KEY``).
+Set ``BLACK_COMPANY_DISABLE_DEEPSEEK=1`` to force template fallbacks.
+Set ``BLACK_COMPANY_DEEPSEEK_TELEGRAM_ONLY=1`` to call DeepSeek only for Telegram intro/recap (not every graph node).
 
 Env:
   TELEGRAM_BOT_TOKEN       — required (from @BotFather)
   TELEGRAM_ALLOWED_USER_IDS — optional comma-separated Telegram user ids; if empty, any user (dev only)
   BLACK_COMPANY_DATA_DIR   — optional; default `./data` — growth memory SQLite + metadata
+  BLACK_COMPANY_NAME       — optional; org line for PM copy (Telegram + LLM prompts)
+  BLACK_COMPANY_BLURB      — optional; one line what the company does
+  BLACK_COMPANY_PROJECTS   — optional; active tracks / products (short)
 
-Chat: send what you’d say to a PM (“hey, can we add a wallet to this project?”). The bot replies in-character,
-then runs the graph until it needs Owner input — reply with normal text (yes / no / notes). Optional:
-type **growth** or **milestones** for memory stats. Slash commands are optional (/start /reset /growth /run).
+Chat: **PM chat** by default (planning, context, how this works). A **concrete brief**, **/run**, or
+**New project:** … starts the team graph (typing indicator, one reply with Owner gate or recap). **Hi / hey**
+stays a lightweight wave. **growth** / **milestones** for memory stats. Slash: /start /reset /growth /run /help.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import uuid
@@ -24,6 +32,7 @@ from langgraph.types import Command
 
 try:
     from telegram import Update
+    from telegram.constants import ChatAction
     from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 except ImportError as e:
     raise ImportError(
@@ -33,8 +42,17 @@ except ImportError as e:
 from black_company.graph import build_graph
 from black_company.growth import format_report, record_event
 from black_company.integrations.telegram_chat import (
+    casual_greeting_reply,
+    casual_greeting_while_owner_waits,
     format_interrupt,
+    help_text,
+    idle_pm_chat_fallback,
     is_growth_lookup,
+    looks_like_greeting_only,
+    looks_like_idle_workflow_brief,
+    looks_like_meta_chat_while_awaiting_owner,
+    looks_like_new_brief_while_awaiting_owner,
+    owner_gate_sidebar_fallback,
     pm_intro_after_request,
     pm_run_complete_message,
     strip_new_project_prefix,
@@ -42,6 +60,38 @@ from black_company.integrations.telegram_chat import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat:
+        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+
+
+async def _run_with_typing_pulse(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    coro: Any,
+) -> Any:
+    """Keep Telegram 'typing…' alive during long sync work (invoke pulses ~4s)."""
+    stop = asyncio.Event()
+
+    async def _pulse() -> None:
+        while not stop.is_set():
+            await _send_typing(update, context)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                continue
+
+    pulse = asyncio.create_task(_pulse())
+    try:
+        return await coro
+    finally:
+        stop.set()
+        pulse.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pulse
 
 
 def _allowed_user(user_id: int) -> bool:
@@ -75,8 +125,40 @@ def _actor(update: Update) -> str | None:
     return str(u.id) if u else None
 
 
+async def _resolve_pm_intro(text: str | None) -> str | None:
+    if not text:
+        return None
+    from black_company.llm.deepseek_copy import try_telegram_pm_intro
+
+    llm = await asyncio.to_thread(try_telegram_pm_intro, text)
+    return llm or pm_intro_after_request(text)
+
+
+async def _resolve_pm_recap(out: dict[str, Any]) -> str:
+    from black_company.llm.deepseek_copy import try_telegram_run_recap
+
+    llm = await asyncio.to_thread(try_telegram_run_recap, out)
+    return llm or pm_run_complete_message(out)
+
+
 async def _invoke(graph: Any, inp: dict[str, Any] | Command, config: dict[str, Any]) -> dict[str, Any]:
     return await asyncio.to_thread(graph.invoke, inp, config)
+
+
+async def _graph_state_values(graph: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """Read merged LangGraph state for UX copy (e.g. explain Owner gate)."""
+
+    def _get() -> dict[str, Any]:
+        try:
+            snap = graph.get_state(config)
+            v = getattr(snap, "values", None) if snap is not None else None
+            if isinstance(v, dict):
+                return dict(v)
+        except Exception as e:
+            logger.debug("graph.get_state failed: %s", e)
+        return {}
+
+    return await asyncio.to_thread(_get)
 
 
 def _invoke_lock(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Lock:
@@ -119,7 +201,7 @@ async def _emit_invoke_result(
         )
         body = format_interrupt(intr)
         if pm_preamble:
-            body = f"{pm_preamble}\n\n— — —\n\n{body}"
+            body = f"{pm_preamble}\n\n{body}"
         await update.effective_message.reply_text(truncate(body, 4000))
         return
 
@@ -137,9 +219,9 @@ async def _emit_invoke_result(
             "pair_round": out.get("pair_round"),
         },
     )
-    body = pm_run_complete_message(out)
+    body = await _resolve_pm_recap(out)
     if pm_preamble:
-        body = f"{pm_preamble}\n\n— — —\n\n{body}"
+        body = f"{pm_preamble}\n\n{body}"
     await update.effective_message.reply_text(truncate(body, 4000))
 
 
@@ -165,9 +247,13 @@ async def _start_workflow(
         thread_id=tid,
         detail={"from_chat": bool(intro_from_user_text)},
     )
-    await update.effective_message.reply_text("On it — running the team on this now.")
-    out = await _invoke(graph, inp, config)
-    preamble = pm_intro_after_request(intro_from_user_text) if intro_from_user_text else None
+    out = await _run_with_typing_pulse(
+        update,
+        context,
+        _invoke(graph, inp, config),
+    )
+    await _send_typing(update, context)
+    preamble = await _resolve_pm_intro(intro_from_user_text) if intro_from_user_text else None
     await _emit_invoke_result(update, context, out, pm_preamble=preamble)
 
 
@@ -176,13 +262,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("Not authorized.")
         return
     await update.effective_message.reply_text(
-        "I’m your PM hub — talk like we’re already in Slack.\n\n"
-        "• Send what you need, e.g. “can we add a wallet feature to this project?”\n"
-        "• When I pause for **Owner** review, reply in plain English (yes / no / notes).\n"
-        "• Say **growth** or **milestones** to see what the team remembered from past runs.\n"
-        "• **New project:** … starts a fresh thread with that brief (optional prefix).\n\n"
-        "Optional commands: /reset (clear session), /run (demo default brief), /growth."
+        "PM hub — talk like Slack; org blurb comes from `.env` (`BLACK_COMPANY_*`).\n\n"
+        "/help — flow + Owner pauses\n"
+        "/reset — new run"
     )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user and not _allowed_user(update.effective_user.id):
+        await update.effective_message.reply_text("Not authorized.")
+        return
+    await update.effective_message.reply_text(truncate(help_text(), 4000))
 
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -235,7 +325,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if context.chat_data.get("awaiting_resume"):
-            context.chat_data["awaiting_resume"] = False
             if "thread_id" not in context.chat_data:
                 await update.effective_message.reply_text(
                     "No active session — just describe what you want to ship."
@@ -244,17 +333,46 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             tid = context.chat_data["thread_id"]
             config = {"configurable": {"thread_id": tid}}
             graph = context.application.bot_data["graph"]
-            chat = update.effective_chat.id
+
+            if looks_like_greeting_only(text):
+                await update.effective_message.reply_text(truncate(casual_greeting_while_owner_waits(), 4000))
+                return
+
+            if looks_like_meta_chat_while_awaiting_owner(text):
+                values = await _graph_state_values(graph, config)
+                from black_company.llm.deepseek_copy import try_telegram_owner_gate_sidebar
+
+                spec = str(values.get("spec") or "")
+                st = str(values.get("status") or "")
+                llm = await asyncio.to_thread(try_telegram_owner_gate_sidebar, text, spec, st)
+                msg = llm or owner_gate_sidebar_fallback(text, spec, st)
+                await update.effective_message.reply_text(truncate(msg, 4000))
+                return
+
+            if looks_like_new_brief_while_awaiting_owner(text):
+                await update.effective_message.reply_text(
+                    truncate(
+                        "Still on the Owner line above — that pitch would count as your answer. "
+                        "**/reset** if you meant a new thread."
+                    )
+                )
+                return
+
+            context.chat_data["awaiting_resume"] = False
 
             record_event(
                 kind="owner_resume",
                 source="telegram",
                 actor=_actor(update),
-                chat_id=str(chat),
+                chat_id=str(update.effective_chat.id),
                 thread_id=tid,
                 detail={"text_preview": text[:300]},
             )
-            out = await _invoke(graph, Command(resume=text), config)
+            out = await _run_with_typing_pulse(
+                update,
+                context,
+                _invoke(graph, Command(resume=text), config),
+            )
             await _emit_invoke_result(update, context, out, pm_preamble=None)
             return
 
@@ -262,17 +380,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("telegram: recovering session (run_finished=false, not awaiting resume)")
             context.chat_data["run_finished"] = True
 
-        body = strip_new_project_prefix(text).strip()
-        if not body:
-            await update.effective_message.reply_text("Tell me what you’d like the team to work on.")
+        if looks_like_greeting_only(text):
+            await update.effective_message.reply_text(truncate(casual_greeting_reply(), 4000))
             return
 
-        await _start_workflow(
-            update,
-            context,
-            spec=body,
-            intro_from_user_text=body,
-        )
+        if looks_like_idle_workflow_brief(text):
+            body = strip_new_project_prefix(text).strip()
+            if not body:
+                await update.effective_message.reply_text("Tell me what you’d like the team to work on.")
+                return
+            await _start_workflow(
+                update,
+                context,
+                spec=body,
+                intro_from_user_text=body,
+            )
+            return
+
+        from black_company.llm.deepseek_copy import try_telegram_idle_pm_chat
+
+        llm = await asyncio.to_thread(try_telegram_idle_pm_chat, text)
+        msg = llm or idle_pm_chat_fallback()
+        await update.effective_message.reply_text(truncate(msg, 4000))
 
 
 def _load_dotenv() -> None:
@@ -298,6 +427,7 @@ def main() -> None:
     application.bot_data["graph"] = graph
 
     application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("run", run_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("growth", growth_cmd))

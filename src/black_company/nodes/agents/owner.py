@@ -33,7 +33,7 @@ def owner_kickoff(state: TeamState) -> dict:
     reply = interrupt(
         {
             "phase": "kickoff",
-            "prompt": "Owner — Kickoff: does this brief match what we're committing to? Reply yes, or no with what to change.",
+            "prompt": "Owner — Kickoff: approve this brief before we run Product planning and hand off to Engineering. Reply yes, or no with what to change.",
             "spec": spec,
         }
     )
