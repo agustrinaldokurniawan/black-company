@@ -1,19 +1,51 @@
-"""Owner human-in-the-loop stubs (replace with interrupt + resume)."""
+"""Owner human-in-the-loop (LangGraph interrupt — resume via Telegram, CLI, etc.)."""
 
 from __future__ import annotations
+
+from typing import Any
+
+from langgraph.types import interrupt
 
 from black_company.state import TeamState
 
 
-def owner_kickoff(_state: TeamState) -> dict:
-    return {
-        "owner_kickoff": "approved",
-        "owner_notes": "[stub] Owner approved kickoff via PM.",
-    }
+def _norm_reply(reply: Any) -> str:
+    if isinstance(reply, dict):
+        return str(reply.get("text", reply.get("message", reply)))
+    return str(reply).strip()
 
 
-def owner_accept(_state: TeamState) -> dict:
-    return {
-        "owner_acceptance": "ok",
-        "owner_notes": "[stub] Owner accepted delivery via PM.",
-    }
+def _is_yes(reply: Any) -> bool:
+    s = _norm_reply(reply).lower()
+    return s.startswith("y") or s in ("approve", "approved", "ok", "yes", "1", "👍")
+
+
+def owner_kickoff(state: TeamState) -> dict:
+    spec = state.get("spec") or ""
+    reply = interrupt(
+        {
+            "phase": "kickoff",
+            "prompt": "Approve this plan? Reply yes or no (add notes after no).",
+            "spec": spec,
+        }
+    )
+    if _is_yes(reply):
+        return {"owner_kickoff": "approved", "owner_notes": _norm_reply(reply)}
+    return {"owner_kickoff": "needs_pm_revision", "owner_notes": _norm_reply(reply)}
+
+
+def owner_accept(state: TeamState) -> dict:
+    reply = interrupt(
+        {
+            "phase": "acceptance",
+            "prompt": "Accept delivery? Reply yes or no.",
+            "summary": state.get("pm_readiness_summary") or "",
+            "spec_excerpt": (state.get("spec") or "")[:800],
+        }
+    )
+    if _is_yes(reply):
+        return {"owner_acceptance": "ok", "owner_notes": _norm_reply(reply)}
+    if _is_no(reply):
+        return {"owner_acceptance": "needs_rework", "owner_notes": _norm_reply(reply)}
+    # unclear — treat as rework
+    return {"owner_acceptance": "needs_rework", "owner_notes": _norm_reply(reply)}

@@ -17,9 +17,14 @@ dependencies = [
 llm = [
     "langchain-openai>=0.2",
 ]
+telegram = [
+    "python-telegram-bot>=21",
+    "python-dotenv>=1.0",
+]
 
 [project.scripts]
 black-company-demo = "black_company.demo:main"
+black-company-telegram = "black_company.integrations.telegram_app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
