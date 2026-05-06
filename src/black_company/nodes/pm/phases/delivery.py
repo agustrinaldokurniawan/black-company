@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from black_company.constants import NodeId, Status
+from black_company.growth.store import record_lesson
 from black_company.nodes.pm.types import PhaseHandler
 from black_company.state import TeamState
 
@@ -23,6 +24,15 @@ def handle_building(state: TeamState) -> dict:
 
 def handle_qa_pending(state: TeamState) -> dict:
     if state.get("qa_result") == "fail":
+        record_lesson(
+            trigger="qa_fail",
+            detail={
+                "qa_report": (state.get("qa_report") or "")[:2000],
+                "pair_round": state.get("pair_round"),
+                "impl_excerpt": (state.get("impl") or "")[:600],
+                "spec_excerpt": (state.get("spec") or "")[:400],
+            },
+        )
         return {
             "status": Status.BUILDING,
             "assignee_hints": "fix from QA",

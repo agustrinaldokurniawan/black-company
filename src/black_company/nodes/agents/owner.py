@@ -6,6 +6,7 @@ from typing import Any
 
 from langgraph.types import interrupt
 
+from black_company.growth.store import record_lesson
 from black_company.state import TeamState
 
 
@@ -31,6 +32,10 @@ def owner_kickoff(state: TeamState) -> dict:
     )
     if _is_yes(reply):
         return {"owner_kickoff": "approved", "owner_notes": _norm_reply(reply)}
+    record_lesson(
+        trigger="owner_kickoff_reject",
+        detail={"notes": _norm_reply(reply)[:2000], "spec_excerpt": spec[:600]},
+    )
     return {"owner_kickoff": "needs_pm_revision", "owner_notes": _norm_reply(reply)}
 
 
@@ -46,6 +51,17 @@ def owner_accept(state: TeamState) -> dict:
     if _is_yes(reply):
         return {"owner_acceptance": "ok", "owner_notes": _norm_reply(reply)}
     if _is_no(reply):
+        record_lesson(
+            trigger="owner_delivery_reject",
+            detail={
+                "notes": _norm_reply(reply)[:2000],
+                "readiness": (state.get("pm_readiness_summary") or "")[:1200],
+            },
+        )
         return {"owner_acceptance": "needs_rework", "owner_notes": _norm_reply(reply)}
     # unclear — treat as rework
+    record_lesson(
+        trigger="owner_delivery_reject",
+        detail={"notes": _norm_reply(reply)[:2000], "unclear_reply": True},
+    )
     return {"owner_acceptance": "needs_rework", "owner_notes": _norm_reply(reply)}

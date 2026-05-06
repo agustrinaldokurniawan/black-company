@@ -45,3 +45,4 @@ class TeamState(TypedDict, total=False):
 
     assignee_hints: str
     pm_owner_thread: str
+    growth_context: NotRequired[str]
