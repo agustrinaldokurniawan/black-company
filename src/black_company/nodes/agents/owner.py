@@ -21,12 +21,19 @@ def _is_yes(reply: Any) -> bool:
     return s.startswith("y") or s in ("approve", "approved", "ok", "yes", "1", "👍")
 
 
+def _is_no(reply: Any) -> bool:
+    s = _norm_reply(reply).lower()
+    return s in ("n", "no", "nope", "reject", "rejected", "0", "👎") or s.startswith(
+        ("no ", "no,", "nope ")
+    )
+
+
 def owner_kickoff(state: TeamState) -> dict:
     spec = state.get("spec") or ""
     reply = interrupt(
         {
             "phase": "kickoff",
-            "prompt": "Approve this plan? Reply yes or no (add notes after no).",
+            "prompt": "Owner — Kickoff: does this brief match what we're committing to? Reply yes, or no with what to change.",
             "spec": spec,
         }
     )
@@ -43,7 +50,7 @@ def owner_accept(state: TeamState) -> dict:
     reply = interrupt(
         {
             "phase": "acceptance",
-            "prompt": "Accept delivery? Reply yes or no.",
+            "prompt": "Owner — Delivery review: accept this increment for release? Reply yes, or no with rework notes.",
             "summary": state.get("pm_readiness_summary") or "",
             "spec_excerpt": (state.get("spec") or "")[:800],
         }

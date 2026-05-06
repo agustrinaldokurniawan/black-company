@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from black_company.state import TeamState
+from black_company.voice import designer_handoff
 
 
-def designer(_state: TeamState) -> dict:
-    return {"design": "[stub] Designer output: flows + constraints wired to spec."}
+def designer(state: TeamState) -> dict:
+    return {"design": designer_handoff(state)}

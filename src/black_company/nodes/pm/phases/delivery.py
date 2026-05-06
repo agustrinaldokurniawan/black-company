@@ -6,6 +6,7 @@ from black_company.constants import NodeId, Status
 from black_company.growth.store import record_lesson
 from black_company.nodes.pm.types import PhaseHandler
 from black_company.state import TeamState
+from black_company.voice import pm_readiness_after_qa, qa_rework_hint
 
 
 def handle_designing(state: TeamState) -> dict:
@@ -35,13 +36,13 @@ def handle_qa_pending(state: TeamState) -> dict:
         )
         return {
             "status": Status.BUILDING,
-            "assignee_hints": "fix from QA",
+            "assignee_hints": qa_rework_hint(),
             "qa_result": "pending",
             "_next": NodeId.PAIR_PROGRAMMING,
         }
     if state.get("qa_result") == "pass":
         return {
-            "pm_readiness_summary": "[stub] QA pass; scope matches spec.",
+            "pm_readiness_summary": pm_readiness_after_qa(state),
             "status": Status.PM_USER_SHIP_CHECK,
             "user_agent_ship": "pending",
             "assignee_hints": "",
