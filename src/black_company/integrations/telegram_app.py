@@ -19,13 +19,14 @@ Env:
 
 Chat: **PM chat** by default (planning, context, how this works). A **concrete brief**, **/run**, or
 **New project** … (`:` optional) starts the team graph (typing indicator, one reply with Owner gate or recap). **Hi / hey**
-stays a lightweight wave. **growth** / **milestones** for memory stats. Slash: /start /help /run /reset /growth /projects.
+stays a lightweight wave. **growth** / **milestones** for memory stats. Slash: /start /help /run (workflow) /reset /growth /projects /runproj /setenv /cancelsetenv /stopproj.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import os
 import uuid
@@ -45,6 +46,13 @@ except ImportError as e:
 from black_company.graph import build_graph
 from black_company.growth import format_report, record_event
 from black_company.workspace_projects import format_projects_command_message
+from black_company.workspace_run import (
+    list_runnable_project_names,
+    run_project_foreground,
+    stop_project_background,
+    workspace_project_dir,
+)
+from black_company.workspace_dotenv import merge_write_project_env
 from black_company.integrations.telegram_chat import (
     casual_greeting_reply,
     casual_greeting_while_owner_waits,
@@ -182,6 +190,7 @@ def _prepare_thread_for_new_workflow(context: ContextTypes.DEFAULT_TYPE, chat_id
     context.chat_data["run_finished"] = False
     context.chat_data["awaiting_resume"] = False
     context.chat_data.pop("last_interrupt_phase", None)
+    context.chat_data.pop("awaiting_setenv_project", None)
 
 
 async def _emit_invoke_result(
@@ -208,6 +217,7 @@ async def _emit_invoke_result(
         context.chat_data["awaiting_resume"] = True
         context.chat_data["run_finished"] = False
         context.chat_data["last_interrupt_phase"] = _intr_phase(intr)
+        context.chat_data.pop("awaiting_setenv_project", None)
         record_event(
             kind="owner_interrupt",
             source="telegram",
@@ -287,7 +297,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "PM hub — talk like Slack; org blurb comes from `.env` (`BLACK_COMPANY_*`).\n\n"
         "/help — flow + Owner pauses\n"
-        "/projects — repos under `BLACK_COMPANY_PROJECT_ROOT` (if set)\n"
+        "/projects — repos under workspace root\n"
+        "/runproj — run a project using `.black-company-run.toml` in that folder\n"
+        "/setenv — merge KEY=value into a project `.env` from your next message\n"
+        "/stopproj — stop a background process started from that manifest\n"
         "/reset — new run"
     )
 
@@ -313,6 +326,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.chat_data["run_finished"] = True
         context.chat_data.pop("last_interrupt_phase", None)
         context.chat_data.pop("run_invocation_nonce", None)
+        context.chat_data.pop("awaiting_setenv_project", None)
         record_event(
             kind="session_reset",
             source="telegram",
@@ -343,6 +357,107 @@ async def projects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _format_runproj_reply(code: int, text: str) -> str:
+    esc = html.escape(text[:4000])
+    if len(text) > 4000:
+        esc += "\n…(truncated)"
+    label = "ok" if code == 0 else ("timeout" if code == -2 else "error")
+    return f"<b>exit {code}</b> — {html.escape(label)}\n<pre>{esc}</pre>"
+
+
+async def runproj_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _allowed_user(update.effective_user.id):
+        await update.effective_message.reply_text("Not authorized.")
+        return
+    args = context.args or []
+    if not args:
+        names = list_runnable_project_names()
+        if not names:
+            await update.effective_message.reply_text(
+                "No runnable projects yet. In each workspace subfolder add a file named "
+                "`.black-company-run.toml` with a <code>command</code> array (see examples in the repo). "
+                "<code>BLACK_COMPANY_PROJECT_ROOT</code> must be set.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        body = "\n".join(f"• <b>{html.escape(n)}</b>" for n in names)
+        await update.effective_message.reply_text(
+            f"<b>Runnable projects</b> (manifest present):\n{body}\n\n"
+            f"Use: <code>/runproj Name</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    name = args[0]
+    await _send_typing(update, context)
+    code, out = await asyncio.to_thread(run_project_foreground, name)
+    await update.effective_message.reply_text(
+        truncate(_format_runproj_reply(code, out), 4000),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def stopproj_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _allowed_user(update.effective_user.id):
+        await update.effective_message.reply_text("Not authorized.")
+        return
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            "Usage: <code>/stopproj ProjectName</code> — stops a background process "
+            "started with <code>background = true</code> in <code>.black-company-run.toml</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    msg = await asyncio.to_thread(stop_project_background, args[0])
+    await update.effective_message.reply_text(html.escape(msg), parse_mode=ParseMode.HTML)
+
+
+async def setenv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _allowed_user(update.effective_user.id):
+        await update.effective_message.reply_text("Not authorized.")
+        return
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            "Usage: <code>/setenv ProjectName</code>\n\n"
+            "Next message: <code>KEY=value</code> lines (one per line; <code>#</code> comments ok). "
+            "Merges into that project’s <code>.env</code> (new keys + overwrites). "
+            "<code>/cancelsetenv</code> to abort.\n\n"
+            "<i>Secrets in Telegram may be exposed — prefer mounting .env for production.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    name = args[0]
+    if workspace_project_dir(name) is None:
+        await update.effective_message.reply_text(
+            "Unknown project folder — check <code>BLACK_COMPANY_PROJECT_ROOT</code> and the subfolder name.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    context.chat_data["awaiting_setenv_project"] = name
+    record_event(
+        kind="setenv_prompt",
+        source="telegram",
+        actor=_actor(update),
+        chat_id=str(update.effective_chat.id),
+        thread_id=str(context.chat_data.get("thread_id", "")),
+        detail={"project": name},
+    )
+    await update.effective_message.reply_text(
+        f"Send <code>KEY=value</code> lines for <b>{html.escape(name)}</b> (one message). "
+        f"<code>/cancelsetenv</code> to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cancelsetenv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _allowed_user(update.effective_user.id):
+        await update.effective_message.reply_text("Not authorized.")
+        return
+    context.chat_data.pop("awaiting_setenv_project", None)
+    await update.effective_message.reply_text("Cancelled — no .env merge pending.")
+
+
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed_user(update.effective_user.id):
         await update.effective_message.reply_text("Not authorized.")
@@ -368,6 +483,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 format_projects_command_message(),
                 parse_mode=ParseMode.HTML,
             )
+            return
+
+        pending_setenv = context.chat_data.get("awaiting_setenv_project")
+        if pending_setenv:
+            low = text.strip().lower()
+            if low in ("/cancelsetenv", "cancel", "cancelsetenv"):
+                context.chat_data.pop("awaiting_setenv_project", None)
+                await update.effective_message.reply_text("Cancelled — no .env changes.")
+                return
+            ok, msg = await asyncio.to_thread(merge_write_project_env, pending_setenv, text)
+            if ok:
+                context.chat_data.pop("awaiting_setenv_project", None)
+                record_event(
+                    kind="setenv_merged",
+                    source="telegram",
+                    actor=_actor(update),
+                    chat_id=str(update.effective_chat.id),
+                    thread_id=str(context.chat_data.get("thread_id", "")),
+                    detail={"project": pending_setenv, "parsed_ok": True},
+                )
+                await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+            else:
+                await update.effective_message.reply_text(html.escape(msg))
             return
 
         if context.chat_data.get("awaiting_resume"):
@@ -506,6 +644,10 @@ def main() -> None:
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("growth", growth_cmd))
     application.add_handler(CommandHandler("projects", projects_cmd))
+    application.add_handler(CommandHandler("runproj", runproj_cmd))
+    application.add_handler(CommandHandler("setenv", setenv_cmd))
+    application.add_handler(CommandHandler("cancelsetenv", cancelsetenv_cmd))
+    application.add_handler(CommandHandler("stopproj", stopproj_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     if not os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "").strip():

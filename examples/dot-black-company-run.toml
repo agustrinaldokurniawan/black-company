@@ -1,0 +1,16 @@
+# Copy to:  $BLACK_COMPANY_PROJECT_ROOT/<YourRepo>/.black-company-run.toml
+#
+# `command` is executed with no shell — fixed argv only (safe for Telegram).
+# `cwd` is relative to that project folder.
+# Foreground: output is captured until `timeout_sec` (max 600). Good for builds, tests, one-off scripts.
+# Background: long-running dev servers — stdout/stderr discarded; use `/stopproj <folder>` to SIGTERM the PID.
+
+command = [ "pnpm", "run", "build" ]
+cwd = "."
+timeout_sec = 300
+background = false
+
+# Example: dev server (must background = true or the bot will wait until timeout)
+# command = [ "pnpm", "run", "dev" ]
+# timeout_sec = 600
+# background = true
