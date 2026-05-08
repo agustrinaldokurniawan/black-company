@@ -1,6 +1,6 @@
 """Telegram bot: PM chat by default; concrete briefs (or /run) start the team graph.
 
-Loads `.env` from the current working directory when `python-dotenv` is installed (included in the `telegram` extra).
+Loads `.env` from the current working directory when `python-dotenv` is installed (included in the `telegram` extra), then optional `.env.local` (overrides — useful for host-only paths).
 
 Optional DeepSeek for natural PM + team copy (requires ``pip install -e ".[telegram,llm]"`` and ``DEEPSEEK_API_KEY``).
 Set ``BLACK_COMPANY_DISABLE_DEEPSEEK=1`` to force template fallbacks.
@@ -12,11 +12,14 @@ Env:
   BLACK_COMPANY_DATA_DIR   — optional; default `./data` — growth memory SQLite + metadata
   BLACK_COMPANY_NAME       — optional; org line for PM copy (Telegram + LLM prompts)
   BLACK_COMPANY_BLURB      — optional; one line what the company does
-  BLACK_COMPANY_PROJECTS   — optional; active tracks / products (short)
+  BLACK_COMPANY_PROJECTS   — optional; extra tracks / products (short), after workspace scan
+  BLACK_COMPANY_PROJECT_ROOT — optional; directory whose immediate subfolders are scanned as
+                               existing projects (injected first into PM / LLM context; use a
+                               bind mount in Docker, e.g. host folder → /projects)
 
 Chat: **PM chat** by default (planning, context, how this works). A **concrete brief**, **/run**, or
 **New project** … (`:` optional) starts the team graph (typing indicator, one reply with Owner gate or recap). **Hi / hey**
-stays a lightweight wave. **growth** / **milestones** for memory stats. Slash: /start /reset /growth /run /help.
+stays a lightweight wave. **growth** / **milestones** for memory stats. Slash: /start /help /run /reset /growth /projects.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from langgraph.types import Command
 
 try:
     from telegram import Update
-    from telegram.constants import ChatAction
+    from telegram.constants import ChatAction, ParseMode
     from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 except ImportError as e:
     raise ImportError(
@@ -41,6 +44,7 @@ except ImportError as e:
 
 from black_company.graph import build_graph
 from black_company.growth import format_report, record_event
+from black_company.workspace_projects import format_projects_command_message
 from black_company.integrations.telegram_chat import (
     casual_greeting_reply,
     casual_greeting_while_owner_waits,
@@ -48,6 +52,7 @@ from black_company.integrations.telegram_chat import (
     help_text,
     idle_pm_chat_fallback,
     is_growth_lookup,
+    is_projects_lookup,
     looks_like_greeting_only,
     looks_like_idle_workflow_brief,
     looks_like_kickoff_brief_reaffirmation,
@@ -185,7 +190,16 @@ async def _emit_invoke_result(
     out: dict[str, Any],
     *,
     pm_preamble: str | None,
+    invocation_nonce: int,
 ) -> None:
+    """Apply graph outcome to Telegram state. ``invocation_nonce`` must match ``session_nonce`` (see /reset)."""
+    if context.chat_data.get("session_nonce", 0) != invocation_nonce:
+        logger.info(
+            "Ignoring stale graph result (nonce mismatch — likely /reset won the race): thread=%s",
+            context.chat_data.get("thread_id"),
+        )
+        return
+
     intr = out.get("__interrupt__")
     chat = update.effective_chat.id
     tid = context.chat_data["thread_id"]
@@ -211,6 +225,7 @@ async def _emit_invoke_result(
     context.chat_data["awaiting_resume"] = False
     context.chat_data["run_finished"] = True
     context.chat_data.pop("last_interrupt_phase", None)
+    context.chat_data.pop("run_invocation_nonce", None)
     record_event(
         kind="run_completed",
         source="telegram",
@@ -238,6 +253,8 @@ async def _start_workflow(
 ) -> None:
     chat = update.effective_chat.id
     _prepare_thread_for_new_workflow(context, chat)
+    invocation_nonce = context.chat_data.get("session_nonce", 0)
+    context.chat_data["run_invocation_nonce"] = invocation_nonce
     tid = context.chat_data["thread_id"]
     config = {"configurable": {"thread_id": tid}}
     graph = context.application.bot_data["graph"]
@@ -258,7 +275,9 @@ async def _start_workflow(
     )
     await _send_typing(update, context)
     preamble = await _resolve_pm_intro(intro_from_user_text) if intro_from_user_text else None
-    await _emit_invoke_result(update, context, out, pm_preamble=preamble)
+    await _emit_invoke_result(
+        update, context, out, pm_preamble=preamble, invocation_nonce=invocation_nonce
+    )
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -268,6 +287,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "PM hub — talk like Slack; org blurb comes from `.env` (`BLACK_COMPANY_*`).\n\n"
         "/help — flow + Owner pauses\n"
+        "/projects — repos under `BLACK_COMPANY_PROJECT_ROOT` (if set)\n"
         "/reset — new run"
     )
 
@@ -283,23 +303,27 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed_user(update.effective_user.id):
         await update.effective_message.reply_text("Not authorized.")
         return
-    chat = update.effective_chat.id
-    old_tid = context.chat_data.get("thread_id")
-    context.chat_data["thread_id"] = f"tg-{chat}-{uuid.uuid4().hex[:10]}"
-    context.chat_data["awaiting_resume"] = False
-    context.chat_data["run_finished"] = True
-    context.chat_data.pop("last_interrupt_phase", None)
-    record_event(
-        kind="session_reset",
-        source="telegram",
-        actor=_actor(update),
-        chat_id=str(chat),
-        thread_id=context.chat_data["thread_id"],
-        detail={"previous_thread_id": old_tid},
-    )
-    await update.effective_message.reply_text(
-        "Session cleared. Tell me what you want to build — same as messaging a real PM."
-    )
+    async with _invoke_lock(context):
+        chat = update.effective_chat.id
+        old_tid = context.chat_data.get("thread_id")
+        # Bumps nonce so any in-flight graph completion is ignored (Owner gate / recap).
+        context.chat_data["session_nonce"] = context.chat_data.get("session_nonce", 0) + 1
+        context.chat_data["thread_id"] = f"tg-{chat}-{uuid.uuid4().hex[:10]}"
+        context.chat_data["awaiting_resume"] = False
+        context.chat_data["run_finished"] = True
+        context.chat_data.pop("last_interrupt_phase", None)
+        context.chat_data.pop("run_invocation_nonce", None)
+        record_event(
+            kind="session_reset",
+            source="telegram",
+            actor=_actor(update),
+            chat_id=str(chat),
+            thread_id=context.chat_data["thread_id"],
+            detail={"previous_thread_id": old_tid},
+        )
+        await update.effective_message.reply_text(
+            "Session cleared. Tell me what you want to build — same as messaging a real PM."
+        )
 
 
 async def growth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -307,6 +331,16 @@ async def growth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("Not authorized.")
         return
     await update.effective_message.reply_text(truncate(format_report(limit=15), 4000))
+
+
+async def projects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _allowed_user(update.effective_user.id):
+        await update.effective_message.reply_text("Not authorized.")
+        return
+    await update.effective_message.reply_text(
+        format_projects_command_message(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -327,6 +361,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with _invoke_lock(context):
         if is_growth_lookup(text):
             await update.effective_message.reply_text(truncate(format_report(limit=15), 4000))
+            return
+
+        if is_projects_lookup(text):
+            await update.effective_message.reply_text(
+                format_projects_command_message(),
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if context.chat_data.get("awaiting_resume"):
@@ -397,7 +438,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context,
                 _invoke(graph, Command(resume=text), config),
             )
-            await _emit_invoke_result(update, context, out, pm_preamble=None)
+            resume_nonce = context.chat_data.get("run_invocation_nonce", 0)
+            await _emit_invoke_result(
+                update, context, out, pm_preamble=None, invocation_nonce=resume_nonce
+            )
             return
 
         if not context.chat_data.get("run_finished", True):
@@ -421,10 +465,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        from black_company.llm.deepseek_copy import try_telegram_idle_pm_chat
+        try:
+            from black_company.llm.deepseek_copy import try_telegram_idle_pm_chat
 
-        llm = await asyncio.to_thread(try_telegram_idle_pm_chat, text)
-        msg = llm or idle_pm_chat_fallback()
+            llm = await asyncio.to_thread(try_telegram_idle_pm_chat, text)
+            msg = llm or idle_pm_chat_fallback()
+        except Exception:
+            logger.exception("idle PM chat failed; sending template fallback")
+            msg = idle_pm_chat_fallback()
         await update.effective_message.reply_text(truncate(msg, 4000))
 
 
@@ -434,6 +482,8 @@ def _load_dotenv() -> None:
     except ImportError:
         return
     load_dotenv()
+    # Machine-specific overrides (paths, local flags). Gitignored like `.env`; loaded second so it wins.
+    load_dotenv(".env.local", override=True)
 
 
 def main() -> None:
@@ -455,6 +505,7 @@ def main() -> None:
     application.add_handler(CommandHandler("run", run_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("growth", growth_cmd))
+    application.add_handler(CommandHandler("projects", projects_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     if not os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "").strip():

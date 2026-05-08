@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -68,8 +69,9 @@ def pm_intro_after_request(user_message: str) -> str:
     from black_company.company_context import company_context_for_llm
 
     ctx = company_context_for_llm().strip()
-    if len(ctx) > 320:
-        ctx = ctx[:317] + "…"
+    limit = 2200 if os.environ.get("BLACK_COMPANY_PROJECT_ROOT", "").strip() else 320
+    if len(ctx) > limit:
+        ctx = ctx[: limit - 1] + "…"
     return f"{ctx}\n\nRoger — running kickoff on my side from what you sent."
 
 
@@ -303,7 +305,8 @@ def idle_pm_chat_fallback() -> str:
     return (
         f"{ctx}\n\n"
         "I’m in **chat mode** here (no LLM). For a full PM→Owner→Eng run, send a concrete brief, "
-        "prefix **New project:** …, or use **/run**. Other: **growth**, **/reset**, **/help**."
+        "prefix **New project:** …, or use **/run**. Ask **what projects do we have?** or **/projects** "
+        "for the workspace list. Other: **growth**, **/reset**, **/help**."
     )
 
 
@@ -345,9 +348,13 @@ def help_text() -> str:
         "(chit-chat is treated separately when we can tell).\n"
         "• **/reset** — new LangGraph thread; describe what to build next.\n"
         "• **New project** … — explicit new brief (`:` optional).\n"
-        "• **growth** / **milestones** — what the team stored from past runs.\n\n"
+        "• **growth** / **milestones** — what the team stored from past runs.\n"
+        "• **/projects** or ask e.g. **what projects do we have?** — workspace list from disk (no LLM).\n\n"
+        "**Workspace (existing repos on disk)** — optional:\n"
+        "`BLACK_COMPANY_PROJECT_ROOT` — folder whose **immediate subfolders** are listed for the PM "
+        "(first in org context). **/projects** shows the same list.\n\n"
         "**Org copy for the PM** — set in `.env`:\n"
-        "`BLACK_COMPANY_NAME`, `BLACK_COMPANY_BLURB`, `BLACK_COMPANY_PROJECTS`"
+        "`BLACK_COMPANY_NAME`, `BLACK_COMPANY_BLURB`, `BLACK_COMPANY_PROJECTS` (supplemental env list)."
     )
 
 
@@ -367,6 +374,37 @@ def is_growth_lookup(text: str) -> bool:
     if t.startswith("show growth") or t.startswith("show milestones"):
         return True
     return False
+
+
+def is_projects_lookup(text: str) -> bool:
+    """Inventory questions — answer from disk scan (same as /projects) without calling the LLM."""
+    t = text.strip().lower()
+    if not t or len(t) > 320:
+        return False
+    needles = (
+        "what project ",
+        "what projects",
+        "which project ",
+        "which projects",
+        "projects do we",
+        "project do we",
+        "repos do we",
+        "list projects",
+        "show projects",
+        "our projects",
+        "what repos",
+        "which repos",
+    )
+    if any(n in t for n in needles):
+        return True
+    short_cmds = frozenset({
+        "projects",
+        "project list",
+        "list repos",
+        "repos?",
+        "repos",
+    })
+    return t in short_cmds
 
 
 def strip_new_project_prefix(text: str) -> str:

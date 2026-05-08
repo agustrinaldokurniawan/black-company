@@ -1,6 +1,9 @@
 # Run: copy .env.example to .env and set TELEGRAM_BOT_TOKEN (and optional TELEGRAM_ALLOWED_USER_IDS).
 # Then: docker compose up --build
 #
+# Env precedence for the telegram service: values in `environment:` below override the same keys from `env_file`.
+# Use that for container paths (e.g. BLACK_COMPANY_PROJECT_ROOT=/projects) while `.env` keeps host-oriented copy.
+#
 # Telegram uses long polling: your phone talks to Telegram’s servers; the container only needs
 # outbound HTTPS. You do not need to publish ports or expose the PC to Wi-Fi for the bot to work.
 services:
@@ -11,8 +14,12 @@ services:
       - .env
     environment:
       BLACK_COMPANY_DATA_DIR: /data
+      # Workspace list for the PM: lives only inside Docker (`black_company_workspace` volume), not a host folder.
+      BLACK_COMPANY_PROJECT_ROOT: /projects
     volumes:
       - black_company_data:/data
+      - black_company_workspace:/projects
 
 volumes:
   black_company_data:
+  black_company_workspace:
